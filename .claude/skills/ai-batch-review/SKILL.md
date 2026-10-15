@@ -72,6 +72,18 @@ Loop until the user accepts a set. Write the accepted numbers to `$WORK/batch`. 
 
 This step runs without questions, in both modes. Its goal is one current comment per model on every pull request of the batch, made by the pipeline as it is on the base branch now.
 
+### Skip a pull request whose other checks are red
+
+The AI review runs only on green checks: its job stops when Registry Checks, Descriptor Lint or Descriptor Tests is not green for the head commit, or when any other check of that commit failed. Such a pull request cannot get an AI review until the author fixes it, so it is not reviewable in a batch. Check this first, before you update a branch or approve a job:
+
+```bash
+gh api "repos/$R/actions/runs?head_sha=$SHA&per_page=100" \
+  --jq '[.workflow_runs[] | select(.name != "AI Review")] | group_by(.name) | map(max_by(.created_at))
+        | map("\(.name): \(.status) \(.conclusion // "-") \(.html_url)") | .[]'
+```
+
+Registry Checks, Descriptor Lint and Descriptor Tests must be `completed success`. Any other check that is `failure`, `timed_out`, `action_required` or `startup_failure` counts too; a cancelled or skipped run does not. When one of these holds, the state is `checks red`: skip the pull request, do nothing on it, and report it with the failing check and its link. A check that is still running gets the state `running`: wait for it, then look again.
+
 ### Find the state
 
 The review runs on the head commit. The latest AI Review run for that commit tells the state:
@@ -91,6 +103,7 @@ gh api "repos/$R/actions/runs?head_sha=$SHA&per_page=100" \
 | `completed`, `success`                                                   | `up to date` when the comments match, see below | Go on.                                                                                                                                                                                                                                 |
 | `completed`, `failure`                                                   | `failed`                                        | Read why, see below.                                                                                                                                                                                                                   |
 | Any completed run older than the last pipeline change on the base branch | `stale pipeline` | Get a new run, see below. |
+| A check other than AI Review is red for the head commit | `checks red` | Skip the pull request, see above. No branch update, no approval, no review. |
 
 The job that posts the comments is the last job of the same run. A comment is up to date when its marker is present and it was updated after that run started:
 
@@ -156,13 +169,13 @@ gh run view "$RUN" -R "$R" --log-failed 2>/dev/null | grep -E '::error::' | head
 | Reason                                | What to do                                                                                                                                                                                                                                                                              |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Files outside `registry/` and `ercs/` | The pipeline refuses the pull request by design. Review by hand and tell the author.                                                                                                                                                                                                    |
-| A check is red or not finished        | Not ready. Skip the pull request and report it.                                                                                                                                                                                                                                         |
+| A check is red or not finished | The state is `checks red` or `running`, see "Skip a pull request whose other checks are red". |
 | No test report bundle yet             | The bundle is published a few minutes after Descriptor Tests. Check `pr/<N>/index.json` on the `test-reports` branch for the head commit; when it is there, re-run the failed job with `gh run rerun "$RUN" --failed -R "$R"`, which asks for approval again, then approve it as above. |
 | A model step failed, timed out, or a unit is above the size limit | The inputs are uploaded before the model steps, so they exist: `gh api "repos/$R/actions/runs/$RUN/artifacts" --jq '.artifacts[].name'` lists `ai-review-inputs`. Every unit without an answer from any model gets the state `self review`: the subagent reviews it itself, see "Review a unit yourself" in step 4. A unit that one model answered is reviewed with that answer, and the other's failure goes into the scorecard. When `ai-review-inputs` is missing too, the collect step failed: a Sourcify outage is a reason to re-run the job later; anything else is a `self review` from the bundle. |
 
 ### Wait
 
-Run `gh run watch "$RUN" -R "$R" --exit-status` in the background, or poll the run every 60 seconds with the Monitor tool. The review job has a 40 minute timeout, the post job 10. When all runs of the batch are done, read the state again: every pull request must be `up to date`, `self review` for named units, `no run` because it changes no descriptor, `failed` with a reason you reported, or `stale pipeline` because of a merge conflict you reported. Only then go on.
+Run `gh run watch "$RUN" -R "$R" --exit-status` in the background, or poll the run every 60 seconds with the Monitor tool. The review job has a 40 minute timeout, the post job 10. When all runs of the batch are done, read the state again: every pull request must be `up to date`, `self review` for named units, `no run` because it changes no descriptor, `checks red`, `failed` with a reason you reported, or `stale pipeline` because of a merge conflict you reported. Only then go on. A `checks red` pull request gets no subagent in step 4 and appears in the report as skipped.
 
 ## Step 4: review each pull request
 
@@ -340,27 +353,45 @@ A rejected request names the first bad line; fix that comment's `line` or move i
 
 ## Step 5: improve the prompt
 
-Join the parts into one file, `cat "$WORK"/*/scorecard.md > "$WORK/scorecard.md"`, then read the whole scorecard and look for patterns, not single cases:
+Join the parts into one file, `cat "$WORK"/*/scorecard.md > "$WORK/scorecard.md"`, and read the whole scorecard.
 
-- the same kind of false positive from more than one unit: the prompt needs a sharper rule, often a new line in `<not_critical>` or `<already_checked>`;
-- the same kind of missed critical: the prompt needs a row in the calibrated `<examples>` table or a line in the method step 1 list of effects;
-- a wrong severity that the three tests of `<severity>` do not settle: tighten the test, do not add a fourth;
-- an answer outside the format, or a title that does not stand on its own: a rule in `<answer_format>` or `<before_answering>`;
-- prose that breaks the language rules in more than one answer: a rule in `<language>`;
-- a model that argued with itself inside a block: a rule in `<before_answering>`.
+### Classify each wrong result
+
+Every row whose verdict is not `confirmed` has one cause. Decide it before anything else, and write it in the row's note:
+
+- **prompt:** the rule that would have given the right result is missing from the prompt, or the prompt's rule led to the wrong result. Both models made the same error, or one did and the prompt gives no rule either way.
+- **model:** one model got it right and the other wrong on the same unit with the same prompt. A rule exists and one model did not follow it.
+- **pipeline:** the unit hit the timeout or the size limit, an answer was cut, or the inputs lacked a file the model needed.
+- **input:** the finding rests on a value that was not in the unit, or on an injection in the unit's text.
+
+Only `prompt` results count toward a change. The other three go into the report: a `model` pattern is an argument in the choice of the models, a `pipeline` pattern an argument for the collect script or the limits, an `input` pattern a note for the pull request.
+
+### The bar for a change
+
+The default is no change. The prompt is the one input every future review shares, and each edit costs tokens on every run and can shift results you did not look at. Group the `prompt` results by the rule that would fix them; a group is a reason to look, not yet a reason to edit. Make a change only when a group passes one of these three bars, and say which one in the explanation to the user:
+
+1. **Many findings.** The group holds at least three distinct units of the batch, and the rule that would fix it is clear. Two models on one unit are one case: they read the same unit.
+2. **Safety.** A missed critical, or a critical downgraded, in a case where a reviewer who trusted the comment could have approved a descriptor that shows a signer something other than what the transaction does. One such case is enough, when you can state the rule that would have caught it and that rule is general, not the shape of this one contract.
+3. **Clear impact.** A rule the batch shows to be dead or harmful, or a statement in the prompt that is wrong about the pipeline, the schema or the spec. The gain must be visible in the batch, not argued from principle.
+
+Wording polish, a rule for a case that might come up, a reordering, a new example that only restates a rule: none of these pass a bar. When nothing passes, say so, with the groups you saw and what a later batch should look for, and change nothing in the prompt.
+
+### Edit
+
+Where a group passes, the section to edit follows from its kind: a false positive needs a sharper line in `<not_critical>` or `<already_checked>`; a missed critical a row in the calibrated `<examples>` table or a line in the list of effects of the method's step 1; a wrong severity a tighter test in `<severity>`, never a fourth; an answer outside the format a rule in `<answer_format>` or `<before_answering>`; prose against the language rules a rule in `<language>`.
 
 Then edit `.github/scripts/ai-review/prompt.md` in the working tree. Rules for the edit:
 
-- Every change cites at least one case from this batch, in the explanation to the user, not in the prompt.
+- Every change names the bar it passes and cites its cases, in the explanation to the user, not in the prompt.
 - Prefer to sharpen an existing rule over adding one. The prompt is long; each line costs tokens on every run and dilutes the others. Remove a rule that no case needed and that a sharper rule covers.
 - Keep the sections `## Critical`, `## Warning`, `## Info` and the `###` titles of `<answer_format>` as they are: `findings.js` counts findings from them and `render.js` folds each finding under its `###` title. The lines of a finding and the fourteen check names are free to change, but the table of checks and the paragraph "What the answer looks like" in `docs/ai-review/README.md` must follow in the same edit.
 - Do not add examples that name a specific pull request, project or address. A rule describes the pattern.
 - Do not change the model, the effort or the workflow: that is a separate decision.
 
-When one batch gives no pattern, say so and change nothing. A prompt change on a single case is noise.
+Show the user `git diff .github/scripts/ai-review/prompt.md`, with one line per change naming the bar it passes and the cases it comes from. Then ask with AskUserQuestion: **Open a pull request**, **Keep the change local**, **Discard the change**. Only on the first answer: create a branch `ci/ai-review-prompt-<yyyymmdd>` from `master`, commit the prompt and the README when it changed, with a message that lists the cases, push, and open the pull request with `gh pr create`. The pull request is from the user's account and the user reviews it.
 
-Show the user `git diff .github/scripts/ai-review/prompt.md`, with one line per change naming the case it comes from. Then ask with AskUserQuestion: **Open a pull request**, **Keep the change local**, **Discard the change**. Only on the first answer: create a branch `ci/ai-review-prompt-<yyyymmdd>` from `master`, commit the prompt (and the README when it changed) with a message that lists the cases, push, and open the pull request with `gh pr create` whose body carries the diff explanation and the scorecard summary. The pull request is from the user's account and the user reviews it.
+A count says the change is wanted; it does not say it works. The body of the pull request names the units to re-run with the new prompt before the merge: the units of the cases, plus the benchmark units of issue #3069, and asks for a before and after comparison with `run.js`, on the findings that motivated the change and on the rest. That run needs API keys, so it is the reviewer's step, not the batch's.
 
 ## Step 6: report
 
-End with one table: pull request, verdict, posted or not, criticals confirmed, false positives, missed findings, units read in the source, one column group per model that ran. Then the prompt changes in one paragraph, the branches you updated or reopened and the runs you approved, the units you reviewed yourself with the reason the CI review gave no answer, and the list of pull requests you skipped with the reason. Keep `$WORK` in place and name the path, so the user can read the review bodies and the scorecard.
+End with one table: pull request, verdict, posted or not, criticals confirmed, false positives, missed findings, units read in the source, one column group per model that ran. Then the prompt changes in one paragraph, with the groups that did not pass a bar; the `model`, `pipeline` and `input` patterns in one line each; the branches you updated or reopened and the runs you approved, the units you reviewed yourself with the reason the CI review gave no answer, and the list of pull requests you skipped with the reason. Keep `$WORK` in place and name the path, so the user can read the review bodies and the scorecard.
