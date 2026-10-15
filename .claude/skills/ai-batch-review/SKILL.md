@@ -97,7 +97,7 @@ gh api "repos/$R/actions/runs?head_sha=$SHA&per_page=100" \
 
 | Result                                                                   | State                                           | What to do                                                                                                                                                                                                                             |
 | ------------------------------------------------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No run | `no run` | Update the branch with its base, see "Get a new run" below; the push fires the workflow when the pull request changes a file under `registry/**/*.json` or `ercs/**/*.json`. When no run appears after that, the pull request changes no such file: review it without an AI comment and say so in the report. |
+| No run | `no run` | Update the branch with its base, see "Get a new run" below; the push fires the workflow when the pull request changes a file under `registry/**/*.json` or `ercs/**/*.json`. When no run appears after that, or when the update is refused, the pull request stays `no run`: skip it, post nothing on it, and tell the user in the chat and in the report. A batch review never reviews without an AI review to check. |
 | `status: waiting`                                                        | `waiting for approval`                          | Approve the job, see below.                                                                                                                                                                                                            |
 | `queued` or `in_progress`                                                | `running`                                       | Wait.                                                                                                                                                                                                                                  |
 | `completed`, `success`                                                   | `up to date` when the comments match, see below | Go on.                                                                                                                                                                                                                                 |
@@ -136,13 +136,11 @@ A re-run does not help: a re-run uses the base commit of the original event. Onl
 gh api -X PUT "repos/$R/pulls/$N/update-branch"
 ```
 
-The call needs write access to the head branch: a branch of the repository itself, or a fork with "allow edits from maintainers" on. When it is refused, or when it answers that the branch is already up to date, close and reopen the pull request instead, which fires `reopened`:
+The call needs write access to the head branch: a branch of the repository itself, or a fork with "allow edits from maintainers" on. When it succeeds, a new waiting run appears within a minute; find it with the state query and approve it as below.
 
-```bash
-gh pr close "$N" -R "$R" && gh pr reopen "$N" -R "$R"
-```
+When the merge has a conflict, the state is `conflict`: skip the pull request. Post nothing on it, give it no subagent, and tell the user in the chat and in the report that it was skipped because the branch conflicts with master and the author has to resolve that first.
 
-Either way a new waiting run appears within a minute; find it with the state query and approve it as below. When the update fails on a merge conflict, no new run is possible: review with the old comment, tell the author about the conflict in the review, and record in the scorecard which pipeline commit produced the comment, so a finding is scored against the prompt that produced it, not against the current one. List every branch you updated, closed and reopened in the report.
+When the call is refused, or when the branch is already up to date, no new run is possible from your side either. Never close and reopen the pull request to force one: that notifies everyone, runs every workflow again, and is not what a close means. Instead, review with the comment that exists, and record in the scorecard which pipeline commit produced it, so a finding is scored against the prompt that produced it and not against the current one. When the refusal is the fork setting, say in the review that the author can get a fresh review by updating the branch with master. List every branch you updated in the report.
 
 ### Approve a waiting job
 
@@ -175,7 +173,7 @@ gh run view "$RUN" -R "$R" --log-failed 2>/dev/null | grep -E '::error::' | head
 
 ### Wait
 
-Run `gh run watch "$RUN" -R "$R" --exit-status` in the background, or poll the run every 60 seconds with the Monitor tool. The review job has a 40 minute timeout, the post job 10. When all runs of the batch are done, read the state again: every pull request must be `up to date`, `self review` for named units, `no run` because it changes no descriptor, `checks red`, `failed` with a reason you reported, or `stale pipeline` because of a merge conflict you reported. Only then go on. A `checks red` pull request gets no subagent in step 4 and appears in the report as skipped.
+Run `gh run watch "$RUN" -R "$R" --exit-status` in the background, or poll the run every 60 seconds with the Monitor tool. The review job has a 40 minute timeout, the post job 10. When all runs of the batch are done, read the state again: every pull request must be `up to date`, `self review` for named units, `no run`, `checks red`, `conflict`, `failed` with a reason you reported, or `stale pipeline` with the refusal you reported. Only then go on. A `no run`, `checks red` or `conflict` pull request gets no subagent in step 4 and appears in the report as skipped.
 
 ## Step 4: review each pull request
 
@@ -394,4 +392,4 @@ A count says the change is wanted; it does not say it works. The body of the pul
 
 ## Step 6: report
 
-End with one table: pull request, verdict, posted or not, criticals confirmed, false positives, missed findings, units read in the source, one column group per model that ran. Then the prompt changes in one paragraph, with the groups that did not pass a bar; the `model`, `pipeline` and `input` patterns in one line each; the branches you updated or reopened and the runs you approved, the units you reviewed yourself with the reason the CI review gave no answer, and the list of pull requests you skipped with the reason. Keep `$WORK` in place and name the path, so the user can read the review bodies and the scorecard.
+End with one table: pull request, verdict, posted or not, criticals confirmed, false positives, missed findings, units read in the source, one column group per model that ran. Then the prompt changes in one paragraph, with the groups that did not pass a bar; the `model`, `pipeline` and `input` patterns in one line each; the branches you updated and the runs you approved, the units you reviewed yourself with the reason the CI review gave no answer, and the list of pull requests you skipped with the reason. Keep `$WORK` in place and name the path, so the user can read the review bodies and the scorecard.
